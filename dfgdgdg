@@ -1,0 +1,250 @@
+
+# -----------A2DP FUNCTIONS----------------------------#
+    def set_device_address(self, address):
+        """
+        Sets the current Bluetooth device for media streaming/control.
+
+        Args:
+            address (str): Bluetooth MAC address.
+        returns:
+            None
+        """
+        self.device_address = address
+        self.device_path = self.find_device_path(address)
+        self.device_sink = self.get_sink_for_device(address)
+
+    def get_sink_for_device(self, address):
+        """
+        Finds the PulseAudio sink associated with a Bluetooth device.
+
+        Args:
+            address (str): Bluetooth MAC address.
+
+        Returns:
+            str | None: Sink name if found, else None.
+        """
+        try:
+            sinks_output = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True)
+            address_formatted = address.replace(":", "_").lower()
+            for line in sinks_output.splitlines():
+                if address_formatted in line.lower():
+                    return line.split()[1]
+        except Exception as e:
+            self.log.info(f"Error getting sink for device: {e}")
+        return None
+
+    def is_a2dp_streaming(self) -> bool:
+        """
+        Check if an A2DP stream is currently active using PulseAudio.
+
+        Returns:
+            bool: True if audio is streaming to a Bluetooth A2DP sink, False otherwise.
+        """
+
+        try:
+            # Get all active sink inputs (audio streams)
+            output = subprocess.check_output("pactl list sink-inputs", shell=True, text=True)
+
+            # Check if any sink input is directed to a Bluetooth A2DP sink
+            if "bluez_sink" in output:
+                return True
+
+            return False
+
+        except subprocess.CalledProcessError:
+            # pactl command failed
+            return False
+
+
+    def start_a2dp_stream(self, address, filepath=None):
+        device_path = self.find_device_path(address)
+        self.log.info(device_path)
+        if not device_path:
+            return "Device not found"
+        try:
+            # Ensure device_address is stored for stop_a2dp_stream
+            self.device_address = address # Store the address of the device being streamed to
+            device = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.device_iface)
+            self.log.info(device)
+            props = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.props_iface)
+            connected = props.Get(constants.device_iface, "Connected")
+            if not connected:
+                device.Connect()
+                time.sleep(1.5)
+            self.log.info(f"[A2DP] Connected to {address}")
+            if not filepath:
+                return "No audio file specified for streaming"
+
+            # Convert MP3 to WAV if needed
+            if filepath.endswith(".mp3"):
+                wav_file = "/tmp/temp_audio.wav"
+                if not self.convert_mp3_to_wav(filepath, wav_file):
+                    return False
+                filepath = wav_file
+
+            self.stream_process = subprocess.Popen(
+                ["aplay", filepath],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            return f"Streaming started with {filepath}"
+        except Exception as e:
+            return f"A2DP stream error: {str(e)}"
+
+
+    def convert_mp3_to_wav(self, audio_path, wav_path):
+        """
+        Convert an MP3 file to WAV format using ffmpeg.
+
+        Args:
+            audio_path (str): Path to the MP3 file.
+            wav_path (str): Output path for the converted WAV file.
+
+        Returns:
+            bool: True if conversion succeeds, False otherwise.
+        """
+        try:
+            subprocess.run(['ffmpeg', '-y', '-i', audio_path, wav_path], check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log.info(f"Conversion failed [mp3 to wav]: {e}")
+            return False
+
+    def stop_a2dp_stream(self):
+        """
+        Stop the current A2DP audio stream.
+
+        :return: Status message.
+        """
+        if self.stream_process:
+            self.stream_process.terminate()
+            self.stream_process = None
+            return "A2DP stream stopped"
+        return "No active A2DP stream"
+
+    def get_connected_a2dp_source_devices(self):
+        """
+        Get a list of currently connected A2DP source devices on the given interface.
+
+        Args:
+            interface (str): Controller interface like 'hci0' or 'hci1'
+
+        Returns:
+            dict: Dictionary of connected A2DP source devices (MAC -> Name)
+        """
+        connected = {}
+        #adapter_path = f"/org/bluez/{interface}"
+        om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
+        objects = om.GetManagedObjects()
+
+        for path, interfaces in objects.items():
+            if constants.device_iface in interfaces:
+                props = interfaces[constants.device_iface]
+                if props.get("Connected", False) and props.get("Adapter") == self.adapter_path:
+                    uuids = props.get("UUIDs", [])
+                    if any("110a" in uuid.lower() for uuid in uuids):  # A2DP Source UUID
+                        address = props.get("Address")
+                        name = props.get("Name", "Unknown")
+                        connected[address] = name
+        return connected
+
+    def get_connected_a2dp_sink_devices(self):
+        """
+        Get a list of currently connected A2DP sink devices on the given interface.
+
+        Args:
+            interface (str): Controller interface like 'hci0' or 'hci1'
+
+        Returns:
+            dict: Dictionary of connected A2DP sink devices (MAC -> Name)
+        """
+        connected = {}
+        #adapter_path = f"/org/bluez/{interface}"
+        om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
+        objects = om.GetManagedObjects()
+
+        for path, interfaces in objects.items():
+            if constants.device_iface in interfaces:
+                props = interfaces[constants.device_iface]
+                if props.get("Connected", False) and props.get("Adapter") == self.adapter_path:
+                    uuids = props.get("UUIDs", [])
+                    if any("110b" in uuid.lower() for uuid in uuids):  # A2DP Sink UUID
+                        address = props.get("Address")
+                        name = props.get("Name", "Unknown")
+                        connected[address] = name
+        return connected
+
+
+    def _get_media_control_interface(self, address, controller=None):
+        """
+        Retrieve the MediaControl1 interface for a given device.
+
+        Args:
+            address (str): The MAC address of the Bluetooth device.
+            controller (str, optional): The controller interface (e.g., 'hci0', 'hci1').
+                                        If None, will match any controller.
+
+        Returns:
+            dbus.Interface: The MediaControl1 D-Bus interface or None if not found.
+        """
+        try:
+            om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
+            objects = om.GetManagedObjects()
+            formatted_addr = address.replace(":", "_").upper()
+
+            self.log.info("Searching for MediaControl1 interface...")
+            for path, interfaces in objects.items():
+                if "org.bluez.MediaControl1" in interfaces and formatted_addr in path:
+                    if controller:
+                        if f"/{controller}/dev_{formatted_addr}" in path:
+                            self.log.info(f"Found MediaControl1 interface at: {path}")
+                            return dbus.Interface(
+                                self.bus.get_object(constants.bluez_service, path),
+                                "org.bluez.MediaControl1"
+                            )
+                    else:
+                        self.log.info(f"Found MediaControl1 interface at: {path}")
+                        return dbus.Interface(
+                            self.bus.get_object(constants.bluez_service, path),
+                            "org.bluez.MediaControl1"
+                        )
+
+            self.log.info(f"No MediaControl1 interface found for device: {address} on controller: {controller or 'any'}")
+        except Exception as e:
+            self.log.info(f"Failed to get MediaControl1 interface: {e}")
+        return None
+
+    def media_control(self, command,address):
+        """
+        Send an AVRCP media control command to a connected A2DP device using the correct controller.
+
+        Supported commands: play, pause, next, previous, rewind.
+
+        :param command: The command to send as a string.
+        :return: Result message.
+        """
+
+        valid = {
+            "play": "Play",
+            "pause": "Pause",
+            "next": "Next",
+            "previous": "Previous",
+            "rewind": "Rewind"
+        }
+
+        if command not in valid:
+            return f"Invalid command: {command}"
+
+        #om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
+        #objects = om.GetManagedObjects()
+
+        # Filter MediaControl1 interfaces under the current adapter (e.g., hci0)
+
+        try:
+            control_iface =self._get_media_control_interface(address,self.interface)
+            getattr(control_iface, valid[command])()
+            return f"AVRCP {command} sent to {address}"
+        except Exception as e:
+            return f"Error sending AVRCP {command}: {str(e)}"
+
+        return f"No MediaControl1 interface found under {self.interface} (is device connected via A2DP with AVRCP?)" these are some of my a2dp functions.. connect pair everyhting is working but eventhough device is connected a2dp functions are not working 
