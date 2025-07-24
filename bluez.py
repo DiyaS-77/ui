@@ -6,12 +6,18 @@ import re
 import subprocess
 import time
 import logging
+from threading import Thread
+from gi.repository import GLib
 
 from logger import Logger
 from Backend_lib.Linux import hci_commands as hci
 from utils import run
 import constants
-from gi.repository import GObject
+
+try:
+    from gi.repository import GObject
+except ImportError:
+    import gobject as GObject
 
 # Set the D-Bus main loop
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -26,46 +32,241 @@ class BluetoothDeviceManager:
     streaming audio (A2DP), media control (AVRCP), and removing Bluetooth devices.
     """
 
-    def __init__(self,interface,log_path):
+    def __init__(self, capability=None,interface=None, log_path=None):
         """
         Initialize the BluetoothDeviceManager by setting up the system bus and adapter.
         """
         self.interface = interface
         self.log=Logger("UI")
+        self.log_path= log_path
+        self.initialize_dbus()
+        self.device_address=None
+        self.stream_process = None
+        self.device_path = None
+        self.device_address = None
+        self.device_sink = None
+        self.devices = {}
+        self.last_session_path = None
+        self.opp_process = None
+        self.bd_address = None
+        self.controllers_list = {}
+        self.handles = None
+        self.bluetoothd_process = None
+        self.pulseaudio_process = None
+        self.hcidump_process = None
+        self.bluetoothd_log_name = None
+        self.pulseaudio_log_name = None
+        self.hcidump_log_name = None
+        self.capability = capability
+        self.agent_path = constants.agent_path
+        self.agent = None
+
+#----------INITIALIZING DBUS------------------#
+    def initialize_dbus(self):
         if self.interface:
             self.bus = dbus.SystemBus()
             self.adapter_path = f'/org/bluez/{self.interface}'
             self.adapter_proxy = self.bus.get_object(constants.bluez_service, self.adapter_path)
             self.adapter = dbus.Interface(self.adapter_proxy, constants.adapter_iface)
-            self.device_address=None
-            self.stream_process = None
-            self.device_path = None
-            self.device_address = None
-            self.device_sink = None
-            self.devices = {}
-            self.last_session_path = None
-            self.opp_process = None
 
-        #self.log=log
-        if self.log:
-            self.bd_address = None
-            self.controllers_list = {}
-            self.handles = None
-            self.interface = interface
-            self.log_path = None
+#-----------AGENT----------------#
+    def set_trusted(path):
+        """
+        Set the Bluetooth device at the given D-Bus path as trusted.
 
-        self.log_path = log_path
-        if self.log_path:
-            self.bluetoothd_process = None
-            self.pulseaudio_process = None
-            self.hcidump_process = None
-            self.bluetoothd_log_name = None
-            self.pulseaudio_log_name = None
-            self.hcidump_log_name = None
-            self.interface = interface
+        Args:
+            path (str): The D-Bus object path of the device.
+        returns:
+        	None
+        """
+        props = dbus.Interface(bus.get_object(constants.bluez_service, path), constants.props_iface)
+        props.Set(constants.device_iface, "Trusted", True)
 
+    def raise_rejected_error(message="Rejected by user"):
+        """
+        Raises a dbus.DBusException with the BlueZ Rejected error name.
+        """
+        error = dbus.DBusException(message)
+        error._dbus_error_name = "org.bluez.Error.Rejected"
+        raise error
 
-#---------CONTROLLER DETAILS----------------------#
+    def set_exit_on_release(self, exit_on_release):
+        """
+        Set whether the agent should terminate the main loop on release.
+
+        Args:
+            exit_on_release (bool): If True, stop the main loop on release.
+        returns:
+            None
+        """
+        self.exit_on_release = exit_on_release
+
+    @dbus.service.method(constants.agent_interface, in_signature="", out_signature="")
+    def Release(self):
+        """
+        Called when the agent is released by BlueZ.
+
+        args: None
+        returns: None
+        """
+        print("Release")
+        if self.exit_on_release:
+            mainloop.quit()
+
+    @dbus.service.method(constants.agent_interface, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        """
+        Ask the user to authorize a service request.
+
+        Args:
+            device (str): The device object path.
+            uuid (str): The UUID of the requested service.
+        returns:
+            None
+        """
+        print("AuthorizeService (%s, %s)" % (device, uuid))
+        set_trusted(device)
+        return
+
+    @dbus.service.method(constants.agent_interface, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        """
+        Ask the user to enter a PIN code for pairing.
+
+        Args:
+            device (str): The device object path.
+
+        Returns:
+            str: The PIN code entered by the user.
+        """
+        print("RequestPinCode (%s)" % (device))
+        set_trusted(device)
+        return "0000"
+
+    @dbus.service.method(constants.agent_interface, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        """
+        Ask the user to enter a numeric passkey.
+
+        Args:
+            device (str): The device object path.
+
+        Returns:
+            dbus.UInt32: The passkey as a 32-bit unsigned integer.
+        """
+        print("RequestPasskey (%s)" % (device))
+        set_trusted(device)
+        return dbus.UInt32(123456)
+
+    @dbus.service.method(constants.agent_interface, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        """
+        Display the passkey and how many digits have been entered so far.
+
+        Args:
+            device (str): The device object path.
+            passkey (int): The passkey to display.
+            entered (int): Number of digits entered so far.
+        returns:
+            None
+        """
+        print("DisplayPasskey (%s, %06u entered %u)" % (device, passkey, entered))
+
+    @dbus.service.method(constants.agent_interface, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        """
+        Display a PIN code for manual entry.
+
+        Args:
+            device (str): The device object path.
+            pincode (str): The PIN code to display.
+        returns:
+            None
+        """
+        print("DisplayPinCode (%s, %s)" % (device, pincode))
+
+    @dbus.service.method(constants.agent_interface, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        """
+        Ask the user to confirm the displayed passkey.
+
+        Args:
+            device (str): The device object path.
+            passkey (int): The passkey to confirm.
+        returns:
+            None
+        """
+        print("RequestConfirmation (%s, %06d)" % (device, passkey))
+        set_trusted(device)
+        return
+
+    @dbus.service.method(constants.agent_interface, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        """
+        Ask the user to authorize pairing with the device.
+
+        Args:
+            device (str): The device object path.
+        returns:
+            None
+        """
+        print("RequestAuthorization (%s)" % (device))
+        set_trusted(device)
+        return
+
+    @dbus.service.method(constants.agent_interface, in_signature="", out_signature="")
+    def Cancel(self):
+        """
+        Called if the pairing request was canceled.
+
+        args: None
+        returns: None
+        """
+        print("Cancel")
+
+    def register_agent(self):
+        """
+        Starts the D-Bus main loop and registers the custom Bluetooth agent with BlueZ.
+
+        This sets up the D-Bus connection, registers the agent with the 1 interface,
+        and runs the GLib main loop in a background thread.
+
+        args: None
+        returns: None
+        """
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self.bus = dbus.SystemBus()
+
+        # Create and register your existing Agent
+        self.agent = BluetoothDeviceManager(self.bus)
+        self.mainloop = GLib.MainLoop()
+
+        # Register the agent with BlueZ
+        manager = dbus.Interface(
+            self.bus.get_object(constants.bluez_service, "/org/bluez"),
+            constants.agent_manager_iface
+        )
+        manager.RegisterAgent(self.agent_path, self.capability)
+        manager.RequestDefaultAgent(self.agent_path)
+        print(f"[Agent] Registered with capability: {self.capability}")
+
+        # Run the GLib main loop in a background thread
+        thread = Thread(target=self.mainloop.run, daemon=True)
+        thread.start()
+
+    def unregister_agent(self):
+        """
+        Stops the D-Bus main loop if it is running.
+
+        This effectively unregisters the agent and ends the background thread handling the loop.
+
+        args: None
+        returns: None
+        """
+        if self.mainloop and self.mainloop.is_running():
+            self.mainloop.quit()
+
+    #---------CONTROLLER DETAILS----------------------#
     def get_controllers_connected(self):
         """
         Returns the list of controllers connected to the host.
@@ -183,17 +384,40 @@ class BluetoothDeviceManager:
 
 
     def run_command(self, command, log_file=None):
+        """
+        Executes a shell command and captures its output.
+
+        Args:
+            command (str): The shell command to execute.
+            log_file (str, optional): Path to a log file to write output (currently unused).
+
+        Returns:
+            subprocess.CompletedProcess: The completed process object containing stdout, stderr, and return code.
+        """
+
         output = subprocess.run(command, shell=True, capture_output=True, text=True)
         logging.info(f"Command: {command}\nOutput: {output.stdout}")
         return output
 
 
     def start_dbus_service(self):
+        """
+        Starts the D-Bus system daemon using a predefined command.
+
+        Returns:None
+        """
         self.log.info("Starting D-Bus service...")
         self.dbus_process = subprocess.Popen(constants.dbus_command, shell=True)
         self.log.info("D-Bus service started successfully.")
 
     def start_bluetoothd_logs(self):
+        """
+        Starts the bluetoothd service and begins logging its output.
+
+        Returns:
+            str: The path to the bluetoothd log file.
+        """
+
         self.bluetoothd_log_name = os.path.join(self.log_path, "bluetoothd.log")
         subprocess.run("pkill -f bluetoothd", shell=True)
 
@@ -208,9 +432,16 @@ class BluetoothDeviceManager:
 
 
         self.log.info(f"[INFO] Bluetoothd logs started: {self.bluetoothd_log_name}")
-        return self.bluetoothd_log_name
+        return True
 
     def start_pulseaudio_logs(self):
+        """
+        Starts the PulseAudio daemon and begins logging its output.
+
+        Returns:
+            str: The path to the pulseaudio log file.
+        """
+
         self.pulseaudio_log_name = os.path.join(self.log_path, "pulseaudio.log")
         subprocess.run("pkill -f pulseaudio", shell=True)
 
@@ -225,44 +456,33 @@ class BluetoothDeviceManager:
 
 
         self.log.info(f"[INFO] Pulseaudio logs started: {self.pulseaudio_log_name}")
-        return self.pulseaudio_log_name
+        return True
 
-    def stop_bluetoothd_logs(self):
-        self.log.info("[INFO] Stopping bluetoothd logs...")
-        if self.bluetoothd_process:
-            try:
-                self.bluetoothd_process.terminate()
-                self.bluetoothd_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.bluetoothd_process.kill()
-                self.bluetoothd_process.wait()
-            self.bluetoothd_process = None
+    def start_dump_logs(self, interface):
+        """
+        Starts hcidump logging for a given Bluetooth interface.
 
-    def stop_pulseaudio_logs(self):
-        self.log.info("[INFO] Stopping pulseaudio logs...")
-        if self.pulseaudio_process:
-            try:
-                self.pulseaudio_process.terminate()
-                self.pulseaudio_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.pulseaudio_process.kill()
-                self.pulseaudio_process.wait()
-            self.pulseaudio_process = None
+        Args:
+            interface (str): The Bluetooth interface (e.g., 'hci0') to capture logs from.
 
-    def start_dump_logs(self, interface, log_text_browser=None):
+        Returns:
+            str | bool: Path to the log file if successful, False if an error occurs or interface is not provided.
+        """
         try:
             if not interface:
                 self.log.info("[ERROR] Interface is not provided for hcidump")
                 return False
 
-            subprocess.run(f"hciconfig {interface} up".split(), capture_output=True)
+            subprocess.run(
+                constants.hciconfig_up_command.format(interface=interface).split(),
+                capture_output=True
+            )
 
             self.hcidump_log_name = os.path.join(self.log_path, f"{interface}_hcidump.log")
-            hcidump_command = f"/usr/local/bluez/bluez-tools/bin/hcidump -i {interface} -Xt"
-            self.log.info(f"[INFO] Starting hcidump: {hcidump_command}")
+            self.log.info(f"[INFO] Starting hcidump: {constants.hcidump_command}")
 
             self.hcidump_process = subprocess.Popen(
-                hcidump_command.split(),
+                constants.hcidump_command.format(interface=interface).split(),
                 stdout=open(self.hcidump_log_name, 'a+'),
                 stderr=subprocess.STDOUT,
                 bufsize=1,
@@ -270,13 +490,83 @@ class BluetoothDeviceManager:
             )
 
             self.log.info(f"[INFO] hcidump process started: {self.hcidump_log_name}")
-            return self.hcidump_log_name
+            return True
 
         except Exception as e:
             self.log.info(f"[ERROR] Failed to start hcidump: {e}")
             return False
 
+    def stop_bluetoothd_logs(self):
+        """
+        Stops the bluetoothd logging subprocess if it is running.
+
+        Returns:
+            bool: True if the process was terminated or already not running, False otherwise.
+        """
+        self.log.info("[INFO] Stopping bluetoothd logs...")
+
+        if not self.bluetoothd_process:
+            self.log.warning("No bluetoothd process to stop.")
+            return False
+
+        if self.bluetoothd_process.poll() is not None:
+            self.log.info("bluetoothd process already terminated.")
+            self.bluetoothd_process = None
+            return True
+
+        try:
+            self.bluetoothd_process.terminate()
+            self.bluetoothd_process.wait(timeout=5)
+            self.log.info("bluetoothd logs stopped successfully.")
+        except subprocess.TimeoutExpired:
+            self.log.warning("Termination timed out. Killing bluetoothd process...")
+            self.bluetoothd_process.kill()
+            self.bluetoothd_process.wait()
+            self.log.info("bluetoothd process killed.")
+
+        self.bluetoothd_process = None
+        return True
+
+
+    def stop_pulseaudio_logs(self):
+        """
+        Stops the pulseaudio logging subprocess if it is running.
+
+        Returns:
+            bool: True if the process was terminated or already not running, False otherwise.
+        """
+        self.log.info("[INFO] Stopping pulseaudio logs...")
+
+        if not self.pulseaudio_process:
+            self.log.warning("No pulseaudio process to stop.")
+            return False
+
+        if self.pulseaudio_process.poll() is not None:
+            self.log.info("pulseaudio process already terminated.")
+            self.pulseaudio_process = None
+            return True
+
+        try:
+            self.pulseaudio_process.terminate()
+            self.pulseaudio_process.wait(timeout=5)
+            self.log.info("pulseaudio logs stopped successfully.")
+        except subprocess.TimeoutExpired:
+            self.log.warning("Termination timed out. Killing pulseaudio process...")
+            self.pulseaudio_process.kill()
+            self.pulseaudio_process.wait()
+            self.log.info("pulseaudio process killed.")
+
+        self.pulseaudio_process = None
+        return True
+
+
     def stop_dump_logs(self):
+        """
+        Stops the hcidump logging process, if running.
+
+        Returns:
+            bool: True if the process was stopped or not running, False if an error occurred.
+        """
         self.log.info("[INFO] Stopping HCI dump logs")
         if self.hcidump_process:
             try:
@@ -289,7 +579,8 @@ class BluetoothDeviceManager:
 
         if self.interface:
             try:
-                result = subprocess.run(['pgrep', '-f', f'hcidump.*{self.interface}'], capture_output=True, text=True)
+                result = subprocess.run(['pgrep', '-f', f'hcidump.*{self.interface}'],
+                                        capture_output=True, text=True)
                 if result.stdout.strip():
                     pids = result.stdout.strip().split('\n')
                     for pid in pids:
@@ -299,12 +590,40 @@ class BluetoothDeviceManager:
                         subprocess.run(['kill', '-KILL', pid])
             except Exception as e:
                 self.log.info(f"[ERROR] Error killing hcidump: {e}")
+                return False
 
         self.log.info("[INFO] HCI dump logs stopped successfully")
+        return True
 
     def get_controller_details(self, interface=None):
+        """
+        Retrieves and parses detailed information about a given Bluetooth controller interface.
+
+        Args:
+            interface (str, optional): The Bluetooth interface (e.g., "hci0"). If not provided,
+                                       the method uses the last known interface value.
+
+        Returns:
+            dict: A dictionary containing the controller details. Keys include:
+                - 'BD_ADDR': Bluetooth MAC address
+                - 'Name': Controller device name
+                - 'Class': Device class
+                - 'Link policy': Link policy string
+                - 'Link mode': Link mode string
+                - 'HCI Version': HCI version string with spec info
+                - 'LMP Version': LMP version string with spec info
+                - 'Manufacturer': Chipset vendor/manufacturer
+
+        Raises:
+            RuntimeError: If no interface is specified or if the `hciconfig` command fails.
+        """
+        if not interface:
+            raise RuntimeError("Bluetooth interface must be provided")
+
         self.interface = interface
         details = {}
+
+        # Ensure interface is up before querying
         self.run_command(f'hciconfig -a {self.interface} up')
         result = self.run_command(f'hciconfig -a {self.interface}')
 
@@ -327,6 +646,7 @@ class BluetoothDeviceManager:
             elif match := re.match('Manufacturer: (.*)', line):
                 details['Manufacturer'] = match[1]
 
+        # Save as object attributes
         self.name = details.get('Name')
         self.bd_address = details.get('BD_ADDR')
         self.link_policy = details.get('Link policy')
@@ -336,7 +656,6 @@ class BluetoothDeviceManager:
         self.manufacturer = details.get('Manufacturer')
 
         return details
-
 
     def start_discovery(self):
         """
@@ -403,15 +722,15 @@ class BluetoothDeviceManager:
         :param address: Bluetooth device MAC address.
         :return: D-Bus object path or None if not found.
         """
-        om = dbus.Interface(self.bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
         objects = om.GetManagedObjects()
 
         formatted_interface_path = f"/org/bluez/{self.interface}/"
 
         for path, interfaces in objects.items():
-            if "org.bluez.Device1" in interfaces:
+            if constants.device_iface in interfaces:
                 if formatted_interface_path in path:  # Make sure it’s under the correct hci
-                    props = interfaces["org.bluez.Device1"]
+                    props = interfaces[constants.device_iface]
                     if props.get("Address") == address:
                         return path
         return None
@@ -427,16 +746,16 @@ class BluetoothDeviceManager:
         if device_path:
             try:
                 device = dbus.Interface(
-                    self.bus.get_object("org.bluez", device_path),
-                    dbus_interface="org.bluez.Device1"
+                    self.bus.get_object(constants.bluez_service, device_path),
+                    dbus_interface=constants.device_iface
                 )
                 device.Connect()
 
                 props = dbus.Interface(
-                    self.bus.get_object("org.bluez", device_path),
-                    "org.freedesktop.DBus.Properties"
+                    self.bus.get_object(constants.bluez_service, device_path),
+                    constants.props_iface
                 )
-                connected = props.Get("org.bluez.Device1", "Connected")
+                connected = props.Get(constants.device_iface, "Connected")
                 if connected:
                     self.log.info(f"[BluetoothDeviceManager] Connection successful to {address}")
                     return True
@@ -476,35 +795,58 @@ class BluetoothDeviceManager:
 
     def remove_device(self, address):
         """
-           Remove a paired or known Bluetooth device from the system.
+        Removes a paired or known Bluetooth device from the system using BlueZ D-Bus.
 
-           :param address: Bluetooth MAC address of the device.
-           :param interface: Adapter name (e.g., 'hci0') to remove the device from.
-           :return: True if successfully removed or not found, False if an error occurred.
+        Args:
+            address (str): The Bluetooth MAC address of the device to remove.
+
+        Returns:
+            bool: True if the device was removed successfully or already not present,
+                  False if the removal failed or the device still exists afterward.
         """
+        try:
+            obj = self.bus.get_object(constants.bluez_service, "/")
+            manager = dbus.Interface(obj, constants.obj_iface)
+            objects = manager.GetManagedObjects()
 
-        obj = self.bus.get_object(constants.bluez_service, "/")
-        manager = dbus.Interface(obj, constants.obj_iface)
-        objects = manager.GetManagedObjects()
+            target_path = None
+            for path, interfaces in objects.items():
+                if constants.device_iface in interfaces:
+                    if interfaces[constants.device_iface].get("Address") == address and path.startswith(
+                            self.adapter_path):
+                        target_path = path
+                        break
 
+            if not target_path:
+                self.log.info(f"Device with address {address} not found on {self.interface}")
+                return True  # Device already removed
 
-        for path, interfaces in objects.items():
-            if constants.device_iface in interfaces:
-                if interfaces[constants.device_iface].get("Address") == address and path.startswith(self.adapter_path):
-                    try:
-                        adapter = dbus.Interface(
-                            self.bus.get_object(constants.bluez_service, self.adapter_path),
-                            constants.adapter_iface
-                        )
-                        adapter.RemoveDevice(path)
-                        return True
-                    except dbus.exceptions.DBusException as e:
-                        self.log.info(f"Error removing device {address}: {e}")
+            adapter = dbus.Interface(
+                self.bus.get_object(constants.bluez_service, self.adapter_path),
+                constants.adapter_iface
+            )
+            adapter.RemoveDevice(target_path)
+            self.log.info(f"Requested removal of device {address} at path {target_path}")
+
+            time.sleep(0.5)  # Small delay to let BlueZ update state
+            objects_after = manager.GetManagedObjects()
+
+            for path, interfaces in objects_after.items():
+                if constants.device_iface in interfaces:
+                    if interfaces[constants.device_iface].get("Address") == address:
+                        self.log.error(f"Device {address} still present after attempted removal.")
                         return False
-        self.log.info(f"Device with address {address} not found on {self.interface}")
-        return True  # already removed
 
+            self.log.info(f"Device {address} removed successfully.")
+            return True
 
+        except dbus.exceptions.DBusException as e:
+            self.log.error(f"DBusException while removing device {address}: {e}")
+            return False
+
+        except Exception as e:
+            self.log.error(f"Unexpected error while removing device {address}: {e}")
+            return False
 
     def _get_device_interface(self, device_path):
         """
@@ -631,7 +973,7 @@ class BluetoothDeviceManager:
             self.log.info(f"[DEBUG] DBusException while checking connection: {e}")
             return False
 
-    def refresh_device_list(self):
+    def sync_available_devices(self):
         """
         Updates the internal device list with currently available devices.
 
@@ -656,8 +998,14 @@ class BluetoothDeviceManager:
                     }
 
     def get_paired_devices(self):
+        """
+        Retrieves all Bluetooth devices that are currently paired with the system on the specified adapter.
+
+        Returns:
+            dict: A dictionary of paired devices
+
+        """
         paired = {}
-        #adapter_path = f"/org/bluez/{interface}"
         om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
         objects = om.GetManagedObjects()
         for path, interfaces in objects.items():
@@ -670,8 +1018,16 @@ class BluetoothDeviceManager:
         return paired
 
     def get_connected_devices(self):
+        """
+        Retrieves all currently connected Bluetooth devices for the specified adapter.
+
+        This method queries the BlueZ D-Bus object manager and returns a dictionary
+        of devices that are actively connected and match the adapter path.
+
+        Returns:
+            dict: A dictionary of connected devices
+        """
         connected = {}
-        #adapter_path = f"/org/bluez/{interface}"
         om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
         objects = om.GetManagedObjects()
         for path, interfaces in objects.items():
@@ -683,8 +1039,7 @@ class BluetoothDeviceManager:
                     connected[address] = name
         return connected
 
-
-#--------------------OPP FUNCTIONS---------------------#
+    #--------------------OPP FUNCTIONS---------------------#
     def send_file_via_obex(self, device_address, file_path):
         """
         Send a file to a Bluetooth device via OBEX (Object Push Profile).
@@ -703,9 +1058,9 @@ class BluetoothDeviceManager:
 
         try:
             session_bus = dbus.SessionBus()
-            obex_service = "org.bluez.obex"
+            obex_service = constants.obex_service
             manager_obj = session_bus.get_object(obex_service, "/org/bluez/obex")
-            manager = dbus.Interface(manager_obj, "org.bluez.obex.Client1")
+            manager = dbus.Interface(manager_obj, constants.obex_client)
 
             # Clean up old session if it exists
             if self.last_session_path:
@@ -724,7 +1079,7 @@ class BluetoothDeviceManager:
 
             # Push the file
             opp_obj = session_bus.get_object(obex_service, session_path)
-            opp = dbus.Interface(opp_obj, "org.bluez.obex.ObjectPush1")
+            opp = dbus.Interface(opp_obj, constants.obex_obj_push)
             transfer_path = opp.SendFile(file_path)
             transfer_path = str(transfer_path)
             self.log.info(f"Transfer started: {transfer_path}")
@@ -735,7 +1090,7 @@ class BluetoothDeviceManager:
 
             status = "unknown"
             for _ in range(40):
-                status = str(transfer_props.Get("org.bluez.obex.Transfer1", "Status"))
+                status = str(transfer_props.Get(constants.obex_obj_transfer, "Status"))
                 self.log.info(f"Transfer status: {status}")
                 if status in ["complete", "error"]:
                     break
@@ -858,6 +1213,20 @@ class BluetoothDeviceManager:
 
 
     def start_a2dp_stream(self, address, filepath=None):
+        """
+        Initiates an A2DP audio stream to a Bluetooth device using BlueZ.
+
+        If the device is not already connected, it attempts to connect first.
+        Supports optional MP3-to-WAV conversion before streaming using `aplay`.
+
+        Args:
+            address (str): Bluetooth MAC address of the target device.
+            filepath (str, optional): Path to the audio file to stream. Must be a WAV or MP3 file.
+                                          If MP3, it will be converted to WAV automatically.
+
+        Returns:
+            str: Status message indicating success, failure, or error reason.
+        """
         device_path = self.find_device_path(address)
         self.log.info(device_path)
         if not device_path:
@@ -976,6 +1345,19 @@ class BluetoothDeviceManager:
         return connected
 
     def media_control(self, command, address=None):
+        """
+        Sends AVRCP (Audio/Video Remote Control Profile) media control commands to a connected Bluetooth device.
+
+        Supported commands include: play, pause, next, previous, and rewind.
+        This method interacts with the BlueZ `org.bluez.MediaControl1` D-Bus interface.
+
+        Args:
+            command (str): The AVRCP command to send. Must be one of: "play", "pause", "next", "previous", "rewind".
+            address (str, optional): Bluetooth MAC address of the target device. If None, a default may be used.
+
+        Returns:
+            str: Status message indicating success, failure, or invalid command.
+        """
         valid = {
             "play": "Play",
             "pause": "Pause",
@@ -986,8 +1368,6 @@ class BluetoothDeviceManager:
 
         if command not in valid:
             return f"Invalid command: {command}"
-
-        self.log.info(f"Attempting AVRCP '{command}' to {address}")
 
         control_iface = self._get_media_control_interface(address)
 
@@ -1004,6 +1384,15 @@ class BluetoothDeviceManager:
             return f"Error sending AVRCP {command}: {str(e)}"
 
     def _get_media_control_interface(self, address):
+        """
+        Internal helper method to retrieve the `org.bluez.MediaControl1` D-Bus interface for a given Bluetooth device.
+
+        Args:
+            address (str): The MAC address of the target Bluetooth device.
+
+        Returns:
+            dbus.Interface or None: The MediaControl1 D-Bus interface if found, otherwise None.
+           """
         try:
             om = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.obj_iface)
             objects = om.GetManagedObjects()
@@ -1013,12 +1402,12 @@ class BluetoothDeviceManager:
             controller_path = self.adapter_path  # fallback to stored adapter
 
             for path, interfaces in objects.items():
-                if "org.bluez.MediaControl1" in interfaces:
+                if constants.media_iface in interfaces:
                     if formatted_addr in path and path.startswith(controller_path):
                         self.log.info(f" Found MediaControl1 at {path}")
                         return dbus.Interface(
                             self.bus.get_object(constants.bluez_service, path),
-                            "org.bluez.MediaControl1"
+                            constants.media_iface
                         )
 
             self.log.info(f" No MediaControl1 interface found for {address} under {controller_path}")
