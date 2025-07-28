@@ -30,7 +30,6 @@ from PyQt6.QtWidgets import QComboBox
 
 
 from logger import Logger
-from Backend_lib.Linux.bluez import BluetoothDeviceManager
 
 
 
@@ -61,7 +60,7 @@ class TestApplication(QWidget):
     and media control operations using BlueZ and PulseAudio.
     """
 
-    def __init__(self, interface=None, log_path=None, back_callback=None):
+    def __init__(self,bluetooth_device_manager=None, interface=None, log_path=None, back_callback=None):
         """
         Initialize the TestApplication widget.
 
@@ -86,7 +85,7 @@ class TestApplication(QWidget):
         self.controller = Controller()
         #self.daemon_manager = DaemonManager()
         self.test_application_clicked()
-        self.bluetooth_device_manager = BluetoothDeviceManager(interface=self.interface,log_path=self.log_path)
+        self.bluetooth_device_manager =bluetooth_device_manager
 
         self.device_address_source = None
         self.device_address_sink = None
