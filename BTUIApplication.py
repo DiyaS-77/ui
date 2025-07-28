@@ -81,8 +81,6 @@ class BluetoothUIApp(QMainWindow):
         self.bluetooth_device_manager.start_dbus_service()
         self.bluetooth_device_manager.start_bluetoothd_logs()
         self.bluetooth_device_manager.start_pulseaudio_logs()
-
-        self.agent_runner = BluetoothDeviceManager(capability="NoInputNoOutput")
         self.agent_registered=False
         self.register_agent_once()
         self.scroll = None
@@ -116,7 +114,7 @@ class BluetoothUIApp(QMainWindow):
         returns: None
         """
         try:
-            self.agent_runner.register_agent()
+            self.bluetooth_device_manager.register_agent()
             self.agent_registered = True
             self.log.info("Agent registered")
         except Exception as e:
@@ -346,7 +344,7 @@ class BluetoothUIApp(QMainWindow):
 
         run(self.log, f"hciconfig -a {self.bluetooth_device_manager.interface} up")
         self.setWindowTitle('Test Host')
-        self.setCentralWidget(TestApplication(interface=self.bluetooth_device_manager.interface, log_path=self.log_path,
+        self.setCentralWidget(TestApplication(bluetooth_device_manager=self.bluetooth_device_manager,interface=self.bluetooth_device_manager.interface, log_path=self.log_path,
                                                        back_callback=self.show_main))
 
     def show_main(self):
